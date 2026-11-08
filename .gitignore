@@ -1,0 +1,16 @@
+# 本机生成的扫描报告可能包含内网 IP/MAC，默认不提交
+reports/
+lan_scout_error.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 系统/编辑器
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
