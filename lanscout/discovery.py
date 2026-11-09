@@ -23,6 +23,22 @@ from typing import Callable, Iterable, Optional
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
+
+def console_encoding() -> str:
+    """控制台程序（arp/nbtstat 等）输出的真实编码。
+
+    Windows 上这些命令按 OEM 代码页输出（中文系统为 cp936），
+    而 locale.getpreferredencoding() 在 UTF-8 模式下返回 utf-8，
+    直接用它解码会把“动态/静态”变成乱码。
+    """
+    if os.name == "nt":
+        try:
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"  # type: ignore[attr-defined]
+        except Exception:
+            return "mbcs"
+    return locale.getpreferredencoding(False)
+
+
 # ---------------------------------------------------------------------------
 # 端口与服务名称
 # ---------------------------------------------------------------------------
@@ -532,7 +548,7 @@ def read_arp_with_status(timeout: float = 6.0) -> tuple[dict[str, ArpEntry], str
         return entries, f"无法执行 arp -a：{exc}"
     if proc.returncode != 0:
         stderr = (proc.stderr or b"").decode(
-            locale.getpreferredencoding(False), errors="replace"
+            console_encoding(), errors="replace"
         ).strip()
         return entries, f"arp -a 退出码 {proc.returncode}" + (f"：{stderr[-160:]}" if stderr else "")
     for m in _ARP_LINE.finditer(proc.stdout):
@@ -540,7 +556,7 @@ def read_arp_with_status(timeout: float = 6.0) -> tuple[dict[str, ArpEntry], str
         mac = m.group("mac").decode("ascii", errors="ignore").upper()
         kind_raw = m.group("kind")
         try:
-            kind = kind_raw.decode(locale.getpreferredencoding(False), errors="ignore")
+            kind = kind_raw.decode(console_encoding(), errors="ignore")
         except Exception:
             kind = kind_raw.decode("utf-8", errors="ignore")
         if mac in ("00-00-00-00-00-00", "FF-FF-FF-FF-FF-FF"):

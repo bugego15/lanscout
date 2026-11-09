@@ -27,6 +27,7 @@ from .discovery import (
     HTTP_PORTS,
     HTTPS_PORTS,
     SERVICE_LABELS,
+    console_encoding,
     service_label,
     ttl_to_os,
 )
@@ -187,6 +188,18 @@ def _read_dns_name(data: bytes, offset: int) -> tuple[str, int]:
     return ".".join(labels), next_offset
 
 
+# 部分 ISP/家用 DNS 对内网私有地址会返回通配 PTR（如 localhost），
+# 这类名字不带任何主机信息，必须丢弃，否则所有设备都会被命名成同一个名字。
+_BOGUS_PTR_NAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "localdomain",
+    "broadcasthost",
+    "ip6-localhost",
+    "ip6-loopback",
+}
+
+
 def dns_ptr(ip: str, dns_servers: Iterable[str], timeout: float = 0.9) -> str:
     """直接向本机 DNS 发 PTR 查询，避免 socket.gethostbyaddr 长时间阻塞。"""
     qname = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
@@ -235,7 +248,11 @@ def dns_ptr(ip: str, dns_servers: Iterable[str], timeout: float = 0.9) -> str:
                 if rtype == 12 and rclass == 1:
                     ptr, _ = _read_dns_name(data, offset)
                     ptr = ptr.rstrip(".")
-                    if ptr and "in-addr.arpa" not in ptr:
+                    if (
+                        ptr
+                        and ptr.lower() not in _BOGUS_PTR_NAMES
+                        and "in-addr.arpa" not in ptr
+                    ):
                         return ptr[:200]
                 offset += rdlen
         except Exception:
@@ -405,7 +422,7 @@ def netbios_name(ip: str, timeout: float = 3.0) -> str:
     except Exception:
         return ""
     raw = proc.stdout or b""
-    text = raw.decode(locale.getpreferredencoding(False), errors="replace")
+    text = raw.decode(console_encoding(), errors="replace")
     names: list[str] = []
     for line in text.splitlines():
         # <00> UNIQUE 是工作站名，<20> UNIQUE 是文件服务名
@@ -478,6 +495,17 @@ def _mdns_query_names() -> dict[str, str]:
 
 
 def _parse_mdns_response(data: bytes, names: dict[str, str], fallback_ip: str) -> None:
+    """解析 mDNS 应答，尽量把 IP 和设备名对应起来。
+
+    mDNS 里能用的线索有三类：
+    * A 记录：owner name 就是主机名（如 ``DESKTOP-ABC.local``）；
+    * PTR 记录：rdata 是服务实例名（如 ``某某的 MacBook._airplay._tcp.local``），
+      对 Apple 设备/打印机来说，这才是人类可读的名字；
+    * SRV 记录：rdata 里有服务真正的主机名（如 ``DESKTOP-ABC.local``）。
+
+    早期实现只认 A 记录，且把 PTR 的 *服务类型* 当成名字，实例名这段代码
+    留着 ``pass`` 没有落地 —— 结果只回 PTR/SRV 的设备永远拿不到名字。
+    """
     if len(data) < 12:
         return
     _, _, qd, an, _, _ = struct.unpack("!HHHHHH", data[:12])
@@ -485,7 +513,8 @@ def _parse_mdns_response(data: bytes, names: dict[str, str], fallback_ip: str) -
     for _ in range(qd):
         _, offset = _read_dns_name(data, offset)
         offset += 4
-    current_name = ""
+    instance = ""  # PTR rdata 里的实例名
+    srv_host = ""  # SRV rdata 里的目标主机名
     for _ in range(an):
         name, offset = _read_dns_name(data, offset)
         if offset + 10 > len(data):
@@ -493,19 +522,29 @@ def _parse_mdns_response(data: bytes, names: dict[str, str], fallback_ip: str) -
         rtype, rclass, _ttl, rdlen = struct.unpack("!HHIH", data[offset : offset + 10])
         offset += 10
         rdata_offset = offset
-        if rclass == 1 and rtype in (1, 12, 16, 33):
-            if name.lower().endswith(".local") and rtype == 12:
-                current_name = name
-            elif rtype == 1 and rdlen == 4 and name.lower().endswith(".local"):
+        if rclass == 1 and rtype in (1, 12, 33):
+            if rtype == 12:
+                target, _ = _read_dns_name(data, rdata_offset)
+                label = target.split(".")[0] if target else ""
+                # 跳过 _service._tcp.local 这类服务类型名，只留实例名。
+                if label and not label.startswith("_"):
+                    instance = target.rstrip(".")
+            elif rtype == 33 and rdlen > 6:
+                host, _ = _read_dns_name(data, rdata_offset + 6)
+                if host.lower().endswith(".local"):
+                    srv_host = host.rstrip(".")
+            elif rtype == 1 and rdlen == 4:
                 ip = socket.inet_ntoa(data[rdata_offset : rdata_offset + 4])
-                names[ip] = name.rstrip(".")
-            elif rtype == 1 and rdlen == 4 and current_name:
-                ip = socket.inet_ntoa(data[rdata_offset : rdata_offset + 4])
-                names[ip] = current_name.rstrip(".")
+                owner = name.rstrip(".")
+                if owner.lower().endswith(".local"):
+                    names.setdefault(ip, owner)
+                elif srv_host:
+                    names.setdefault(ip, srv_host)
         offset += rdlen
     if fallback_ip and fallback_ip not in names:
-        # 对 Apple 等服务，PTR 的实例名通常比 A 记录更适合作为人类可读名称。
-        pass
+        label = srv_host or instance
+        if label:
+            names[fallback_ip] = label[:120]
 
 
 # ---------------------------------------------------------------------------

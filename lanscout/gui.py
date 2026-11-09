@@ -18,14 +18,26 @@ from typing import Optional
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import APP_NAME, APP_NAME_EN, __version__
+from .compare import (
+    build_inventory,
+    compare_scans,
+    latest_snapshot,
+    list_snapshots,
+    load_scan,
+    render_diff_text,
+    save_snapshot,
+    write_diff_html,
+    write_inventory_csv,
+)
 from .discovery import PORT_PROFILES
 from .models import FreeIP, HostResult, ScanResult
 from .netconfig import MAX_TARGET_HOSTS, get_default_interface, get_interfaces, parse_target
 from .report import default_report_path, write_csv, write_html, write_json
 from .scanner import ScanCancelled, ScanOptions, build_verify_advice, scan, verify_candidate
+from .ssh import HAS_PARAMIKO, QUICK_COMMANDS, SshError, SshSession
 
 APP_BG = "#f2f5fa"
 NAVY = "#0b1f3a"
@@ -322,6 +334,7 @@ class LanScoutApp(tk.Tk):
         self.busy = False
         self.auto_start = auto_start
         self.last_report_path: Optional[Path] = None
+        self.last_snapshot_path: Optional[Path] = None
         self._host_sort_col = "ip"
         self._host_sort_reverse = False
         self._selected_ip: Optional[str] = None
@@ -627,6 +640,14 @@ class LanScoutApp(tk.Tk):
             hint_row, text="打开报告", style="Ghost.TButton", command=self.open_last_report, state=tk.DISABLED
         )
         self.open_report_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self.compare_btn = ttk.Button(
+            hint_row, text="对比上次", style="Ghost.TButton", command=self.compare_last, state=tk.DISABLED
+        )
+        self.compare_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self.inventory_btn = ttk.Button(
+            hint_row, text="导出资产台账", style="Ghost.TButton", command=self.export_inventory
+        )
+        self.inventory_btn.pack(side=tk.RIGHT, padx=(4, 0))
         self._update_mode_hint()
 
     def _build_stats(self, parent: tk.Frame) -> None:
@@ -773,6 +794,24 @@ class LanScoutApp(tk.Tk):
         self.host_tree.bind("<Button-3>", lambda e: self._show_context_menu(e, self.host_tree))
         for key, title, _ in columns:
             self.host_tree.heading(key, command=lambda k=key: self._sort_hosts(k))
+
+        action = tk.Frame(self.host_tab, bg=WHITE)
+        action.pack(fill=tk.X, padx=12, pady=(0, 2))
+        self.ssh_btn = ttk.Button(
+            action,
+            text="SSH 登录选中设备",
+            style="Accent.TButton",
+            command=self.ssh_selected,
+            state=tk.DISABLED,
+        )
+        self.ssh_btn.pack(side=tk.LEFT)
+        tk.Label(
+            action,
+            text="只登录你显式选中的一台设备；口令仅存内存，不保存、不批量尝试",
+            bg=WHITE,
+            fg=MUTED,
+            font=(self.font_family, 8),
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         hint = tk.Label(
             self.host_tab,
@@ -997,6 +1036,10 @@ class LanScoutApp(tk.Tk):
             self.export_html_btn.configure(state=tk.DISABLED)
             self.export_csv_btn.configure(state=tk.DISABLED)
             self.open_report_btn.configure(state=tk.DISABLED)
+            self.compare_btn.configure(state=tk.DISABLED)
+            self.inventory_btn.configure(state=tk.DISABLED)
+            if hasattr(self, "ssh_btn"):
+                self.ssh_btn.configure(state=tk.DISABLED)
         else:
             has_result = self.result is not None
             self.export_html_btn.configure(state=tk.NORMAL if has_result else tk.DISABLED)
@@ -1004,6 +1047,8 @@ class LanScoutApp(tk.Tk):
             self.open_report_btn.configure(
                 state=tk.NORMAL if self.last_report_path and self.last_report_path.exists() else tk.DISABLED
             )
+            self.compare_btn.configure(state=tk.NORMAL if has_result else tk.DISABLED)
+            self.inventory_btn.configure(state=tk.NORMAL)
 
     def _context_text(self, result: Optional[ScanResult]) -> str:
         if result:
@@ -1353,6 +1398,13 @@ class LanScoutApp(tk.Tk):
         self.detail_badge.configure(text="")
         self.export_html_btn.configure(state=tk.NORMAL)
         self.export_csv_btn.configure(state=tk.NORMAL)
+        self.last_snapshot_path = None
+        try:
+            self.last_snapshot_path = save_snapshot(result.to_dict(), _app_dir() / "reports")
+        except Exception as exc:
+            self._log(f"历史快照保存失败：{exc}")
+        if self.last_snapshot_path:
+            self._log(f"历史快照已保存：{self.last_snapshot_path}")
         if report_path:
             self.last_report_path = Path(report_path)
             self.open_report_btn.configure(state=tk.NORMAL)
@@ -1518,6 +1570,8 @@ class LanScoutApp(tk.Tk):
             return
         self._selected_ip = host.ip
         self._show_host_detail(host)
+        if hasattr(self, "ssh_btn"):
+            self.ssh_btn.configure(state=tk.NORMAL)
 
     def _on_host_double_click(self, _event: Optional[tk.Event] = None) -> None:
         selected = self.host_tree.selection()
@@ -1697,6 +1751,10 @@ class LanScoutApp(tk.Tk):
                     command=lambda: (self._show_host_detail(host), self._open_host_window(host)),
                 )
                 menu.add_separator()
+                menu.add_command(
+                    label="SSH 登录这台设备…", command=lambda: self._open_ssh_dialog(host)
+                )
+                menu.add_separator()
                 menu.add_command(label="复制设备摘要", command=lambda: self._copy_text(self.detail_text.get("1.0", tk.END).strip()))
         else:
             free = self._free_items.get(row)
@@ -1866,6 +1924,487 @@ class LanScoutApp(tk.Tk):
             _open_path(self.last_report_path)
         else:
             messagebox.showinfo("提示", "还没有可打开的报告，请先完成一次扫描。")
+
+    # ------------------------------------------------------- 对比与资产台账
+    def compare_last(self) -> None:
+        """与最近一次历史扫描对比，打开差异窗口。"""
+        if self.result is None:
+            messagebox.showinfo("提示", "请先完成一次扫描。")
+            return
+        reports = _app_dir() / "reports"
+        try:
+            base_path = latest_snapshot(reports, exclude=self.last_snapshot_path)
+            if base_path is None:
+                messagebox.showinfo(
+                    "没有历史记录",
+                    "reports/history/ 里还没有更早的扫描结果。\n\n"
+                    "再扫描一次（范围不变），就能看到两次之间的差异。",
+                )
+                return
+            baseline = load_scan(base_path)
+            diff = compare_scans(baseline, self.result.to_dict())
+        except Exception as exc:
+            messagebox.showerror("对比失败", str(exc))
+            return
+        self._log(f"对比历史扫描 {base_path.name}：{diff.headline()}")
+        self._show_diff_window(diff)
+
+    def _show_diff_window(self, diff) -> None:
+        top = tk.Toplevel(self)
+        top.title("扫描对比 · LAN Scout")
+        top.geometry("840x560")
+        top.configure(bg=WHITE)
+        try:
+            top.transient(self)
+        except Exception:
+            pass
+
+        head = tk.Frame(top, bg=NAVY, height=58)
+        head.pack(fill=tk.X)
+        head.pack_propagate(False)
+        tk.Label(
+            head,
+            text=diff.headline(),
+            bg=NAVY,
+            fg="white",
+            font=(self.font_family, 12, "bold"),
+            anchor="w",
+        ).pack(side=tk.LEFT, padx=18, pady=12, fill=tk.X, expand=True)
+
+        body = tk.Frame(top, bg=WHITE)
+        body.pack(fill=tk.BOTH, expand=True, padx=14, pady=(12, 0))
+        text = tk.Text(
+            body,
+            wrap=tk.WORD,
+            bg="#fbfdff",
+            fg=INK,
+            relief=tk.FLAT,
+            font=("Consolas", 9),
+            padx=12,
+            pady=10,
+        )
+        scroll = ttk.Scrollbar(body, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        text.insert("1.0", render_diff_text(diff))
+        text.configure(state=tk.DISABLED)
+
+        footer = tk.Frame(top, bg=WHITE)
+        footer.pack(fill=tk.X, padx=14, pady=12)
+
+        def export_diff() -> None:
+            folder = _app_dir() / "reports"
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                folder = Path(tempfile.gettempdir())
+            stamp = datetime.now().strftime("%Y%m%d_%H%M")
+            path = filedialog.asksaveasfilename(
+                parent=top,
+                title="导出对比报告",
+                initialdir=str(folder),
+                initialfile=f"扫描对比_{stamp}.html",
+                defaultextension=".html",
+                filetypes=[("HTML 报告", "*.html"), ("所有文件", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                target = write_diff_html(diff, path)
+            except Exception as exc:
+                messagebox.showerror("导出失败", str(exc), parent=top)
+                return
+            self._log(f"对比报告已导出：{target}")
+            if messagebox.askyesno("导出成功", f"对比报告已保存：\n{target}\n\n是否立即打开？", parent=top):
+                _open_path(target)
+
+        ttk.Button(footer, text="关闭", style="Ghost.TButton", command=top.destroy).pack(side=tk.RIGHT)
+        ttk.Button(footer, text="导出 HTML", style="Accent.TButton", command=export_diff).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        tk.Label(
+            footer,
+            text="对比以 MAC 为主键，设备换 IP 不会误判成新增 + 消失",
+            bg=WHITE,
+            fg=MUTED,
+            font=(self.font_family, 8),
+        ).pack(side=tk.LEFT)
+        top.bind("<Escape>", lambda e: top.destroy())
+
+    def export_inventory(self) -> None:
+        """把 reports/history/ 里的所有快照聚合成资产台账。"""
+        folder = _app_dir() / "reports"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            folder = Path(tempfile.gettempdir())
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="导出资产台账",
+            initialdir=str(folder),
+            initialfile="资产台账.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 表格", "*.csv"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            scans = [load_scan(p) for p in list_snapshots(folder)]
+            if self.result is not None and self.last_snapshot_path is None:
+                scans.append(self.result.to_dict())
+            if not scans:
+                messagebox.showinfo("提示", "还没有任何扫描记录，请先完成一次扫描。")
+                return
+            rows = build_inventory(scans)
+            target = write_inventory_csv(rows, path)
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
+            return
+        self._log(f"资产台账已导出：{target}（{len(rows)} 台设备 / {len(scans)} 次扫描）")
+        messagebox.showinfo(
+            "导出成功",
+            f"台账已保存：\n{target}\n\n共 {len(rows)} 台设备，基于 {len(scans)} 次扫描。\n"
+            "CSV 带 UTF-8 BOM，可直接用 Excel 打开。",
+        )
+
+    # ------------------------------------------------------------------ SSH
+    def ssh_selected(self) -> None:
+        selected = self.host_tree.selection()
+        host = self._host_items.get(selected[0]) if selected else None
+        if host is None:
+            messagebox.showinfo("提示", "请先在“在线设备”里选择一台设备。")
+            return
+        self._open_ssh_dialog(host)
+
+    def _open_ssh_dialog(self, host: HostResult) -> None:
+        if not HAS_PARAMIKO:
+            messagebox.showwarning(
+                "SSH 功能不可用",
+                "未安装 paramiko，无法使用内置 SSH。\n\n"
+                "在命令行执行一次即可：\n    pip install paramiko\n\n"
+                "安装后重新启动本程序。核心扫描功能不受影响。",
+            )
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"SSH 登录 · {host.ip}")
+        dlg.configure(bg=WHITE)
+        dlg.geometry("440x320")
+        dlg.resizable(False, False)
+        try:
+            dlg.transient(self)
+        except Exception:
+            pass
+
+        body = tk.Frame(dlg, bg=WHITE)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(14, 0))
+
+        def make_field(row: int, label: str, default: str, show: str = "") -> tk.StringVar:
+            tk.Label(body, text=label, bg=WHITE, fg=MUTED, font=(self.font_family, 9)).grid(
+                row=row, column=0, sticky="w", pady=5
+            )
+            var = tk.StringVar(value=default)
+            ttk.Entry(body, textvariable=var, width=26, show=show).grid(
+                row=row, column=1, sticky="we", pady=5
+            )
+            return var
+
+        host_var = make_field(0, "主机", host.ip)
+        port_var = make_field(1, "端口", "22")
+        user_var = make_field(2, "用户名", "root")
+        pwd_var = make_field(3, "口令", "", show="*")
+        body.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            body,
+            text=(
+                f"设备：{host.device_type} · 开放端口 "
+                f"{'、'.join(str(p.port) for p in host.ports) or '—'}\n"
+                "口令只用于本次连接，不写磁盘、不进报告、不记录日志。\n"
+                "请不要把它填进代码或脚本——这是本工具不做批量试登录的前提。"
+            ),
+            bg=WHITE,
+            fg="#8a5a12",
+            font=(self.font_family, 8),
+            justify=tk.LEFT,
+            wraplength=390,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        footer = tk.Frame(dlg, bg=WHITE)
+        footer.pack(fill=tk.X, padx=16, pady=12)
+        status = tk.Label(footer, text="", bg=WHITE, fg=MUTED, font=(self.font_family, 8))
+        status.pack(side=tk.LEFT)
+        connect_btn = ttk.Button(footer, text="连接", style="Accent.TButton")
+        connect_btn.pack(side=tk.RIGHT)
+        ttk.Button(footer, text="取消", style="Ghost.TButton", command=dlg.destroy).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+
+        state: dict[str, object] = {"busy": False, "done": False, "error": "", "session": None}
+
+        def poll() -> None:
+            if not state.get("done"):
+                dlg.after(120, poll)
+                return
+            connect_btn.configure(state=tk.NORMAL)
+            if state.get("error"):
+                state["busy"] = False
+                status.configure(text="")
+                messagebox.showerror("连接失败", str(state["error"]), parent=dlg)
+                return
+            session = state.get("session")
+            dlg.destroy()
+            if session is not None:
+                self._open_ssh_window(session)  # type: ignore[arg-type]
+
+        def do_connect(_event=None) -> None:
+            if state.get("busy"):
+                return
+            try:
+                port = int(port_var.get().strip() or "22")
+            except ValueError:
+                messagebox.showerror("端口错误", "端口必须是数字。", parent=dlg)
+                return
+            target_host = host_var.get().strip()
+            if not target_host:
+                messagebox.showerror("缺少主机", "请填写主机地址。", parent=dlg)
+                return
+            state.update(busy=True, done=False, error="", session=None)
+            connect_btn.configure(state=tk.DISABLED)
+            status.configure(text="正在连接…")
+            username = user_var.get().strip() or "root"
+            password = pwd_var.get()
+
+            def worker() -> None:
+                session = SshSession(
+                    host=target_host, port=port, username=username, _password=password
+                )
+                try:
+                    session.connect()
+                    try:
+                        session.probe_facts()
+                    except SshError:
+                        pass
+                    state["session"] = session
+                except Exception as exc:
+                    state["error"] = str(exc)
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                finally:
+                    state["done"] = True
+
+            threading.Thread(target=worker, daemon=True).start()
+            dlg.after(120, poll)
+
+        connect_btn.configure(command=do_connect)
+        dlg.bind("<Return>", do_connect)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.after(120, lambda: dlg.focus_force())
+
+    def _open_ssh_window(self, session: SshSession) -> None:
+        top = tk.Toplevel(self)
+        top.title(f"SSH · {session.host}")
+        top.geometry("900x640")
+        top.configure(bg=WHITE)
+        try:
+            top.transient(self)
+        except Exception:
+            pass
+
+        head = tk.Frame(top, bg=NAVY, height=54)
+        head.pack(fill=tk.X)
+        head.pack_propagate(False)
+        tk.Label(
+            head,
+            text=session.describe(),
+            bg=NAVY,
+            fg="white",
+            font=(self.font_family, 11, "bold"),
+            anchor="w",
+        ).pack(side=tk.LEFT, padx=14, fill=tk.X, expand=True)
+
+        body = tk.Frame(top, bg=WHITE)
+
+        out = tk.Text(
+            body,
+            wrap=tk.WORD,
+            bg="#0f172a",
+            fg="#d7e3f4",
+            insertbackground="#d7e3f4",
+            relief=tk.FLAT,
+            font=("Consolas", 9),
+            padx=10,
+            pady=8,
+        )
+        scroll = ttk.Scrollbar(body, orient=tk.VERTICAL, command=out.yview)
+        out.configure(yscrollcommand=scroll.set, state=tk.DISABLED)
+
+        entry_row = tk.Frame(top, bg=WHITE)
+        entry_row.pack(fill=tk.X, padx=12, pady=(8, 4), side=tk.BOTTOM)
+        cmd_var = tk.StringVar()
+        entry = ttk.Entry(entry_row, textvariable=cmd_var, font=("Consolas", 10))
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        run_btn = ttk.Button(entry_row, text="执行", style="Accent.TButton")
+        run_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        quick = tk.Frame(top, bg=WHITE)
+        quick.pack(fill=tk.X, padx=12, pady=(6, 0), side=tk.BOTTOM)
+
+        files_row = tk.Frame(top, bg=WHITE)
+        files_row.pack(fill=tk.X, padx=12, pady=(0, 8), side=tk.BOTTOM)
+
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(10, 0))
+        out.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        busy = {"value": False}
+        q: queue.Queue = queue.Queue()
+
+        def append(text: str) -> None:
+            out.configure(state=tk.NORMAL)
+            out.insert(tk.END, text + "\n")
+            out.see(tk.END)
+            out.configure(state=tk.DISABLED)
+
+        def poll() -> None:
+            try:
+                while True:
+                    kind, payload = q.get_nowait()
+                    if kind == "text":
+                        append(payload)
+                    elif kind == "done":
+                        busy["value"] = False
+                        run_btn.configure(state=tk.NORMAL)
+            except queue.Empty:
+                pass
+            try:
+                if top.winfo_exists():
+                    top.after(100, poll)
+            except Exception:
+                pass
+
+        def run_command(command: str) -> None:
+            command = (command or "").strip()
+            if not command or busy["value"]:
+                return
+            cmd_var.set("")
+            busy["value"] = True
+            run_btn.configure(state=tk.DISABLED)
+            append(f"\n$ {command}")
+
+            def worker() -> None:
+                try:
+                    result = session.exec(command)
+                    payload = result.text() or "(无输出)"
+                    if not result.ok:
+                        payload += f"\n[退出码 {result.exit_code}]"
+                except Exception as exc:
+                    payload = f"[错误] {exc}"
+                q.put(("text", payload))
+                q.put(("done", ""))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def submit(_event=None) -> None:
+            run_command(cmd_var.get())
+
+        for index, (label, command) in enumerate(QUICK_COMMANDS):
+            ttk.Button(
+                quick,
+                text=label,
+                style="Small.TButton",
+                command=lambda c=command: run_command(c),
+            ).grid(row=index // 5, column=index % 5, sticky="we", padx=2, pady=2)
+        for column in range(5):
+            quick.grid_columnconfigure(column, weight=1)
+
+        def download_file() -> None:
+            remote = simpledialog.askstring(
+                "下载远程文件", "远程路径，例如 /home/root/app.log", parent=top
+            )
+            if not remote:
+                return
+            local = filedialog.asksaveasfilename(
+                parent=top, title="保存到本机", initialfile=Path(remote).name
+            )
+            if not local:
+                return
+
+            def worker() -> None:
+                try:
+                    target = session.download(remote, local)
+                    q.put(("text", f"[下载完成] {remote} → {target}"))
+                except Exception as exc:
+                    q.put(("text", f"[下载失败] {exc}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def upload_file() -> None:
+            local = filedialog.askopenfilename(parent=top, title="选择要上传的文件")
+            if not local:
+                return
+            remote = simpledialog.askstring(
+                "上传到远程路径", "目标路径，例如 /home/root/", parent=top
+            )
+            if not remote:
+                return
+            if remote.endswith("/"):
+                remote = remote + Path(local).name
+
+            def worker() -> None:
+                try:
+                    session.upload(local, remote)
+                    q.put(("text", f"[上传完成] {local} → {remote}"))
+                except Exception as exc:
+                    q.put(("text", f"[上传失败] {exc}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def close_all() -> None:
+            try:
+                session.close()
+            finally:
+                top.destroy()
+
+        ttk.Button(files_row, text="上传文件", style="Ghost.TButton", command=upload_file).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(files_row, text="下载文件", style="Ghost.TButton", command=download_file).pack(
+            side=tk.LEFT, padx=6
+        )
+        tk.Label(
+            files_row,
+            text="命令直接在该设备上执行，请谨慎操作；会话关闭后不影响设备",
+            bg=WHITE,
+            fg=MUTED,
+            font=(self.font_family, 8),
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(files_row, text="断开", style="Ghost.TButton", command=close_all).pack(side=tk.RIGHT)
+
+        entry.bind("<Return>", submit)
+        top.bind("<Escape>", lambda e: close_all())
+        top.protocol("WM_DELETE_WINDOW", close_all)
+
+        append(f"已登录 {session.username}@{session.host}:{session.port}")
+        if session.fingerprint:
+            append(f"主机指纹 {session.fingerprint}")
+        for key, label in (
+            ("HOST", "主机名"),
+            ("KERNEL", "内核"),
+            ("ARCH", "架构"),
+            ("UPTIME", "运行时长"),
+            ("MEM", "内存"),
+            ("DISK", "根分区"),
+        ):
+            if session.facts.get(key):
+                append(f"  {label:<6} {session.facts[key]}")
+        append("输入命令回车执行；上方按钮是常用只读命令。")
+
+        entry.focus_set()
+        top.after(100, poll)
 
     # ------------------------------------------------------------------ close
     def _on_close(self) -> None:

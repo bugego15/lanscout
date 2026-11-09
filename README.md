@@ -85,8 +85,10 @@
 1. **看在线设备**：点击任意行，右侧显示设备详情；双击可打开独立详情窗口。
 2. **看未发现占用**：切换到“未发现占用 (N)”标签页，选择候选 IP；
 3. **配置前核验**：点击“配置前核验选中 IP”，等待约 5 秒左右，查看核验证据和参考网络参数；
-4. **导出**：顶部“打开报告 / 导出 CSV / 导出 HTML”；
-5. 每次扫描结束会自动在 `reports/` 下保存 HTML 报告和 JSON 原始结果。
+4. **看变化**：扫描完成后点“对比上次”，查看新增/消失设备与端口变化，可导出对比报告；
+5. **登录设备**（可选）：选中一台设备点“SSH 登录选中设备”，执行只读命令或传文件；
+6. **导出**：顶部“打开报告 / 导出 CSV / 导出 HTML / 导出资产台账”；
+7. 每次扫描结束会自动在 `reports/` 下保存 HTML 报告和 JSON 原始结果，并在 `reports/history/` 留一份快照。
 
 ### 扫描模式
 
@@ -156,6 +158,18 @@ python lan_scout.py --cli --target 192.168.1.0/24 --mode standard --verbose
 # 同时导出 HTML、CSV、JSON
 python lan_scout.py --cli -t 192.168.1.0/24 -m deep `
   --html reports/scan.html --csv reports/scan.csv --json reports/scan.json
+
+# 与上一次扫描对比（自动取 reports/history/ 里最近一份）
+python lan_scout.py --cli -t 192.168.1.0/24 --baseline last --diff-html reports/diff.html
+
+# 指定基线文件对比
+python lan_scout.py --cli -t 192.168.1.0/24 --baseline reports\history\scan_20261108_090000.json
+
+# 导出按 MAC 归档的资产台账（默认 reports/资产台账.csv）
+python lan_scout.py --cli -t 192.168.1.0/24 --inventory
+
+# 不想留历史快照时
+python lan_scout.py --cli -t 192.168.1.0/24 --no-history
 ```
 
 参数：
@@ -163,6 +177,7 @@ python lan_scout.py --cli -t 192.168.1.0/24 -m deep `
 ```text
 --cli / --target / -t / --mode / -m (quick|standard|deep)
 --html / --csv / --json / --verbose / -v
+--baseline [JSON|last] / --diff-html / --inventory [CSV] / --no-history
 --list-interfaces / --version
 ```
 
@@ -177,6 +192,37 @@ python lan_scout.py --cli -t 192.168.1.0/24 -m deep `
 
 当前限制最多 4096 个地址；建议单次不超过 /20。
 
+### SSH 登录（可选，需要 paramiko）
+
+扫描只能看到"它开着什么端口"，看不到"里面是什么"。SSH 功能补上这一步：
+**登录单台设备、执行只读命令、传文件**。默认不启用，装一次依赖即可：
+
+```powershell
+pip install paramiko
+```
+
+图形界面：选中一台设备 → 点「SSH 登录选中设备」（或右键 →「SSH 登录这台设备…」）→
+输入端口/用户名/口令 → 连接后进入命令窗口，内置系统信息、磁盘、进程、监听端口、
+网卡、服务、登录记录、dmesg 等一键只读命令，并可上传/下载文件。
+
+命令行：
+
+```powershell
+# 交互式输入口令（推荐，口令不会留在命令历史里）
+python lan_scout.py --ssh root@192.168.1.42 -c "uname -a" -c "df -h"
+
+# 指定端口
+python lan_scout.py --ssh admin@192.168.1.42:2222 -c "systemctl status nginx"
+```
+
+三条硬约束，写在代码里而不是文档里：
+
+1. **只对 `--ssh` 显式指定的那一台设备建连**，不会遍历扫描结果逐个尝试；
+2. **口令只存在于内存**，不写磁盘、不进报告、不进日志，`repr` 里也不出现；
+3. 首次连接会显示主机指纹，采用 TOFU（首次信任），请自行核对。
+
+没有 paramiko 时，扫描、对比、台账等全部功能照常工作，只有这个入口提示安装依赖。
+
 ---
 
 ## 六、输出文件
@@ -187,6 +233,8 @@ python lan_scout.py --cli -t 192.168.1.0/24 -m deep `
 reports/
   局域网扫描报告_<网段>_<时间>.html   # 自包含 HTML，可离线打开
   局域网扫描报告_<网段>_<时间>.json   # 完整结构化结果
+  history/                            # 每次扫描的 JSON 快照，供“对比上次”使用
+  资产台账.csv                        # 导出后生成，按 MAC 归档
 ```
 
 手动导出：
@@ -198,6 +246,35 @@ reports/
 ![HTML 报告预览](docs/report-preview.png)
 
 仓库中的 `docs/example-report.html` 是脱敏演示数据生成的示例报告；实际扫描生成的报告只保存在本机 `reports/` 目录，不随仓库上传。
+
+### 巡检对比：看出“什么变了”
+
+单次扫描只是快照，两次对比才知道发生了什么。每次扫描（图形界面或 CLI）都会在
+`reports/history/` 下留一份 JSON 快照，用 `--baseline` 或界面上的 **对比上次** 即可：
+
+- **新增设备**：新 MAC 出现，可能是有人私接设备；
+- **消失设备**：可能是关机/休眠，也可能是设备被拔走；
+- **端口变化**：例如某台机器今天多了 3389，说明有人开了远程桌面；
+- **身份变化**：主机名、设备类型、厂商、IP 变了。
+
+对比**以 MAC 为主键**：DHCP 环境里同一台设备换了 IP，只会记为“IP 变化”，
+不会被误判成“一台消失 + 一台新增”。两次扫描范围不同时会明确提示，避免误读。
+
+### 资产台账：把多次扫描合成一张表
+
+```powershell
+python lan_scout.py --cli -t 192.168.1.0/24 --inventory
+```
+
+输出 `reports/资产台账.csv`（UTF-8 BOM，Excel 直接打开），按 MAC 归档：
+
+```text
+MAC / 最近 IP / 历史 IP / 厂商 / 设备类型 / 主机名 / 系统判断 /
+开放端口 / 首次发现 / 最后发现 / 出现次数
+```
+
+适合当固定资产表用：设备换 IP 不会多出一行，端口是历次扫描的并集，
+“最后发现”能直接看出哪台机器已经很久没上线。
 
 ---
 
@@ -211,12 +288,12 @@ reports/
 - **主机名**：DNS PTR + NetBIOS `nbtstat -A` + 轻量 mDNS 查询（部分设备/网络可能不响应 mDNS）；
 - **厂商**：离线 OUI 数据库（IEEE / Wireshark manuf，见 `data/oui.json.gz`）。
 
-工具**不会**：
+扫描过程**不会**：
 
-- 尝试登录设备或猜解口令；
+- 尝试登录设备或猜解口令（SSH 入口只在用户显式指定单台设备时建连，口令由用户当场输入，不批量尝试）；
 - 发送漏洞利用或畸形包；
-- 修改扫描设备或被扫描设备的配置；
-- 读取设备文件。
+- 修改被扫描设备的配置；
+- 读取设备文件（SSH 会话中的文件操作由用户逐次触发）。
 
 ---
 
@@ -234,12 +311,16 @@ lan-scout/
 │   ├── fingerprint.py          # HTTP/banner/主机名/设备画像
 │   ├── netconfig.py            # 网卡识别、目标解析
 │   ├── report.py               # HTML / CSV / JSON 导出
+│   ├── compare.py              # 扫描对比、资产台账、历史快照
+│   ├── ssh.py                  # 可选 SSH 登录（需 paramiko）
 │   ├── models.py               # 数据模型
 │   └── oui.py                  # OUI 厂商查询
 ├── data/oui.json.gz            # 离线 OUI 数据库
 ├── tests/test_core.py          # 无网络单元测试
+├── tests/test_compare.py       # 对比 / 台账 / mDNS 解析测试
+├── tests/test_ssh.py           # SSH 参数解析与口令不落盘测试
 ├── docs/                       # 截图
-└── reports/                    # 自动报告
+└── reports/                    # 自动报告与 history/ 快照
 ```
 
 ---
@@ -251,7 +332,8 @@ cd D:\LinuxWork\lan-scout
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖：目标解析、网段直连判断、服务标签、OUI、HTML 转义、CSV 导出等，不访问网络。
+测试覆盖：目标解析、网段直连判断、服务标签、OUI、HTML 转义、CSV 导出、扫描对比、
+资产台账聚合、mDNS 应答解析等，不访问网络。
 
 界面技术：Python 3.10+ / Tkinter / ttk。无第三方依赖。
 
@@ -283,5 +365,9 @@ TCP connect 只是确认端口是否开放，不进行登录或利用。请仅�
 
 本工具仅用于**你拥有或已获得明确授权的网络**。请遵守当地法律法规和网络管理制度。  
 未发现占用的扫描结果不是空闲证明，直接静态配置可能导致 IP 冲突；推荐使用 DHCP 地址保留。
+
+SSH 功能只应用于**你自己管理的设备**。工具刻意没有实现"默认口令字典 + 网段遍历"这类
+批量登录：那既会触发账户锁定，也会把一台巡检设备变成攻击工具。口令不会落盘，
+但**登录后执行的命令会真正改变设备状态**，请自行确认命令内容。
 
 OUI 数据来源：IEEE 注册的 MAC 地址块 / Wireshark `manuf` 数据。
